@@ -1,0 +1,9 @@
+# ROCm PyTorch for pi05-pytorch-fast (gfx1151 / Strix Halo).
+# Installed by: ROCM_ARCH=gfx1151 bash scripts/setup.sh -y
+#
+# Uses AMD manylinux index (same family as onnx-infer/python). Override with:
+#   PI05_ROCM_INDEX=https://rocm.nightlies.amd.com/v2-staging/gfx1151 bash scripts/setup.sh
+torch[device-gfx1151]
+torchvision[device-gfx1151]
+torchaudio
+rocm[devel]

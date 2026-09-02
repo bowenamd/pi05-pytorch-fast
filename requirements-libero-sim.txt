@@ -1,0 +1,14 @@
+# LIBERO simulator (no torch). Matches embedl/pi05-amd-migraphx requirements-sim.txt.
+robosuite==1.4.0
+robomimic==0.3.0
+mujoco==3.9.0
+bddl==3.6.0
+gym==0.25.2
+easydict==1.13
+egl_probe
+h5py
+imageio
+matplotlib
+termcolor
+pynput
+psutil

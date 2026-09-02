@@ -1,0 +1,21 @@
+# Runtime deps for lerobot (--no-deps git install). No robot hardware extras.
+av>=14.2.0,<16
+datasets>=2.19.0
+deepdiff>=7.0.1
+diffusers>=0.27.2
+draccus==0.10.0
+einops>=0.8.0
+flask>=3.0.3
+gdown>=5.1.0
+gymnasium==0.29.1
+h5py>=3.10.0
+huggingface-hub>=0.27.1,<1.0
+imageio[ffmpeg]>=2.34.0
+jsonlines>=4.0.0
+numba>=0.59.0
+omegaconf>=2.3.0
+opencv-python-headless>=4.9.0
+packaging>=24.2
+pymunk>=6.6.0
+pynput>=1.7.7
+termcolor>=2.4.0
