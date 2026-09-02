@@ -1,5 +1,31 @@
 # Fastest gfx1151 PyTorch recipe for OpenPI π0.5 SnapFlow (1-NFE)
 
+## Measured results (2026-09-02)
+
+Machine: AMD Ryzen AI Max+ / Radeon 8060S (`gfx1151`).
+
+| Metric | Value |
+|--------|--------|
+| E2E action chunk latency | **105 ms** (median; `scripts/bench_latency.py`, 1-NFE `sample_actions`) |
+| LIBERO-10 accuracy | **20/20 = 100%** (2 episodes × 10 tasks, seed 0) |
+| `n_action_steps` / `num_inference_steps` | 10 / 1 |
+| Prefix tokens | 776 (batched SigLIP + empty-camera pool 256→64) |
+
+Two episodes per task is a **smoke** for quantization/compile correctness, not a full 500-episode LIBERO score.
+
+## Software (ROCm)
+
+| Component | Version |
+|-----------|---------|
+| GPU | AMD Radeon 8060S (`gfx1151`) |
+| Host ROCm (`/opt/rocm`) | **7.2.4** (70204-93) |
+| `rocm-smi` | 4.0.0+97f5574fe2 |
+| Python | 3.12 |
+| PyTorch (venv) | **2.15.0a0+rocm10.1.0a20260822** |
+| HIP in PyTorch (`torch.version.hip`) | **7.16.26332** |
+| Wheel extra | `torch[device-gfx1151]` from `https://rocm.nightlies.amd.com/whl-multi-arch/` |
+| Arch override | `HSA_OVERRIDE_GFX_VERSION=11.5.1` |
+
 ## What this is
 
 Closed-loop **LeRobot PI05Policy** inference:
@@ -20,7 +46,7 @@ Closed-loop **LeRobot PI05Policy** inference:
 | Item | Value |
 |------|--------|
 | GPU | gfx1151 (e.g. Radeon 8060S / Ryzen AI Max+ 395) |
-| ROCm | 7.x host (`/opt/rocm`) + `rocm[devel]` in the venv |
+| ROCm | Host **7.2.4** (`/opt/rocm`) + `rocm[devel]` in the venv (see table above) |
 | Python | 3.12 |
 | Tools | `uv`, `git`, HIP compiler (for the INT4 extension) |
 
@@ -82,7 +108,7 @@ python scripts/bench_latency.py
 ```
 
 First call pays `torch.compile` autotune (minutes). Median after warmup is the number
-to compare (~102 ms on 8060S).
+to compare (**105 ms** on 8060S).
 
 `download_checkpoints.sh` rewrites SnapFlow `config.json` once (drops `_reflex_*`
 keys that stock LeRobot rejects). Later eval/bench runs are a no-op if already clean.
