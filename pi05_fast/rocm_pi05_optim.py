@@ -161,6 +161,15 @@ def apply_rocm_pi05_optimizations(policy: Any, *, compile_model: bool | None = N
         from pi05_fast.rocm_antialias import enable_antialias
 
         enable_antialias()
+        # ROCm 10.1 disables Inductor's origami GEMM heuristic, so its autotuner
+        # mis-ranks triton over hipBLASLt for the bf16 SigLIP/expert GEMMs.
+        # Forcing ATEN routes them to hipBLASLt (~2% E2E, accuracy-neutral).
+        gemm_backends = os.environ.get("PI05_INDUCTOR_GEMM_BACKENDS", "ATEN").strip()
+        if gemm_backends:
+            import torch._inductor.config as _ic
+
+            _ic.max_autotune_gemm_backends = gemm_backends
+            print(f"rocm-opt: inductor GEMM backends = {gemm_backends}", flush=True)
         mode = os.environ.get("PI05_COMPILE_MODE", "max-autotune-no-cudagraphs")
         w4_note = " + W4A4 custom_op" if n_w4a4 else ""
         try:
