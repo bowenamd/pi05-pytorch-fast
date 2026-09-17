@@ -6,8 +6,8 @@ Machine: AMD Ryzen AI Max+ / Radeon 8060S (`gfx1151`).
 
 | Metric | Value |
 |--------|--------|
-| E2E action chunk latency | **104 ms** default, **89 ms** with `PI05_LANG_TOKENS=64` (median; `scripts/bench_latency.py`, 1-NFE `sample_actions`) |
-| LIBERO-10 accuracy | **20/20 = 100%** (2 episodes × 10 tasks, seed 0) |
+| E2E action chunk latency | **104 ms** default, **81 ms** with `PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1` (median; `scripts/bench_latency.py`, 1-NFE `sample_actions`) |
+| LIBERO-10 accuracy | **20/20 = 100%** (2 episodes × 10 tasks, seed 0); unchanged with the knobs above (39/40 over seeds 0+1 either way) |
 | `n_action_steps` / `num_inference_steps` | 10 / 1 |
 | Prefix tokens | 776 (batched SigLIP + empty-camera pool 256→64); **640** with `PI05_LANG_TOKENS=64` |
 
@@ -114,10 +114,12 @@ source env.sh
 
 python scripts/bench_latency.py                        # 104 ms
 PI05_LANG_TOKENS=64 python scripts/bench_latency.py    #  89 ms
+PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1 \
+    python scripts/bench_latency.py                    #  81 ms
 ```
 
 First call pays `torch.compile` autotune (minutes). Median after warmup is the number
-to compare (**104 ms** on 8060S, **89 ms** with `PI05_LANG_TOKENS=64`).
+to compare (**104 ms** on 8060S, **81 ms** with both knobs).
 
 The synthetic prompt fills 52 of the 200 padded language tokens, matching LIBERO-10
 (`PI05_BENCH_LANG_LEN` overrides it).
@@ -158,6 +160,7 @@ pi05-pytorch-fast/
 | `PI05_W4A4_FUSE_QUANT` | `1` | Shared QKV / gate-up quant |
 | `PI05_INDUCTOR_GEMM_BACKENDS` | `ATEN` | Inductor GEMM backend. ROCm 10.1 disables the origami heuristic, so Inductor mis-ranks triton over hipBLASLt; `ATEN` is ~2% faster. Set empty to restore triton autotune |
 | `PI05_LANG_TOKENS` | unset (off) | Trim trailing **padded** language tokens to this bucket (prefix = 576 + N). Real tokens are never dropped: if the prompt does not fit, the full 200 are used and a warning is printed. `64` → prefix 640 = exactly 5 `gemm_iu4` `BM=128` tiles (−14% E2E, LIBERO-10 still 20/20) |
+| `PI05_CACHE_EMPTY_CAM` | `0` (off) | Cache the empty-camera SigLIP embedding. With `empty_cameras=1` the placeholder camera is a constant `-1` image, so its embedding never changes, yet a full vision forward runs on it every frame. Caching it batches only the real cameras (−7 ms). Not bit-exact: bf16 SigLIP output depends on batch size (rel err ~4e-3) |
 | `SNAPFLOW_TEACHER_POLICY` | `~/model_data/pi05_libero_v044` | Processor json/safetensors |
 | `PALIGEMMA_TOKENIZER_PATH` | `~/model_data/paligemma2-3b-pt-224` | Local tokenizer |
 
@@ -166,7 +169,9 @@ pi05-pytorch-fast/
 - SigLIP fp16 (slower than bf16 on this GPU)
 - SigLIP / LM / expert FlashAttention-2 (no win; FA2 + 4D mask crashes)
 - LM SDPA (slower than eager with additive 4D masks)
-- Quantizing SigLIP 4-bit (MLP `K=4304` not multiple of 64; not in this recipe)
+- Quantizing SigLIP 4-bit (MLP `K=4304` not multiple of 64; attn projections cost ~1 LIBERO
+  episode for only −1.7% latency)
+- W4A4 on the action expert (at `M=50` the INT4 path is *slower* than bf16 hipBLASLt)
 - ONNX / MIGraphX / ORT (parent `pi05-migraphx` package)
 
 ## License / provenance

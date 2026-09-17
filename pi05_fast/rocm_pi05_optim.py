@@ -64,24 +64,56 @@ def _use_embedl_empty_cam_pool(model) -> bool:
     return int(getattr(model.config, "empty_cameras", 0) or 0) > 0
 
 
+def install_empty_cam_cache(model) -> bool:
+    """Precompute the empty-camera SigLIP embedding (constant -1 image, so it never changes)."""
+    import torch
+
+    if os.environ.get("PI05_CACHE_EMPTY_CAM", "0") == "0":
+        return False
+    n_empty = int(getattr(model.config, "empty_cameras", 0) or 0)
+    if n_empty <= 0:
+        return False
+    res = getattr(model.config, "image_resolution", (224, 224))
+    ref = next(model.paligemma_with_expert.paligemma.parameters())
+    blank = torch.full((1, 3, int(res[0]), int(res[1])), -1.0, dtype=ref.dtype, device=ref.device)
+    with torch.no_grad():
+        emb = model.paligemma_with_expert.embed_image(blank)
+    model._empty_cam_emb = emb
+    model._empty_cam_emb_pooled = pool_cam2_image_tokens(emb)
+    model._n_empty_cams = n_empty
+    print(f"rocm-opt: empty-camera SigLIP cached ({n_empty} slot(s); skips a full vision forward)", flush=True)
+    return True
+
+
 def _batched_embed_prefix(self, images, img_masks, tokens, masks):
     import torch
 
     embs, pad_masks, att_masks = [], [], []
     num_images = len(images)
     bsize = images[0].shape[0]
-    batched_images = torch.cat(images, dim=0)
     pool_last = _use_embedl_empty_cam_pool(self) and num_images >= 1
 
     def image_embed_func(img):
         return self.paligemma_with_expert.embed_image(img)
 
+    # Trailing empty cameras are a constant -1 image; reuse their cached embedding.
+    n_cached = getattr(self, "_n_empty_cams", 0) if hasattr(self, "_empty_cam_emb") else 0
+    n_real = num_images - n_cached if n_cached and num_images > n_cached else num_images
+    batched_images = torch.cat(images[:n_real], dim=0)
     batched_emb = self._apply_checkpoint(image_embed_func, batched_images)
-    img_embs = batched_emb.reshape(num_images, bsize, batched_emb.shape[1], batched_emb.shape[2])
+    img_embs = batched_emb.reshape(n_real, bsize, batched_emb.shape[1], batched_emb.shape[2])
     for i in range(num_images):
-        cam = img_embs[i]
-        if pool_last and i == num_images - 1:
-            cam = pool_cam2_image_tokens(cam)
+        if i < n_real:
+            cam = img_embs[i]
+            if pool_last and i == num_images - 1:
+                cam = pool_cam2_image_tokens(cam)
+        else:
+            cached = (
+                self._empty_cam_emb_pooled
+                if (pool_last and i == num_images - 1)
+                else self._empty_cam_emb
+            )
+            cam = cached.expand(bsize, -1, -1)
         num_img_embs = cam.shape[1]
         embs.append(cam)
         pad_masks.append(img_masks[i][:, None].expand(bsize, num_img_embs))
@@ -278,6 +310,7 @@ def apply_rocm_pi05_optimizations(policy: Any, *, compile_model: bool | None = N
     elif not compile_model:
         print("rocm-opt: bf16 + batched SigLIP + eager attn (compile off)", flush=True)
 
+    install_empty_cam_cache(model)
     install_lang_token_trim(model)
 
     if torch.cuda.is_available():
