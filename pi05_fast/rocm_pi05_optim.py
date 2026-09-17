@@ -346,6 +346,39 @@ def install_rocm_pi05_eval_hooks() -> None:
 
     @classmethod
     def wrapped(cls, *args, **kwargs):
+        # PI05Policy.__init__ does model.to(config.device) with device=None → cuda.
+        # from_pretrained then load_file's a host state dict and load_state_dict
+        # copies it onto those params. On gfx1151 UMA that is two ~16 GB copies
+        # in the same DRAM; copy_ runs GPU-idle for many minutes (or swap-thrashes).
+        # Build on CPU; apply_rocm_pi05_optimizations then .to("cuda") + bf16.
+        config = kwargs.get("config")
+        if config is None:
+            from lerobot.configs.policies import PreTrainedConfig
+
+            path = args[0] if args else kwargs.get("pretrained_name_or_path")
+            cfg_kw = {
+                k: kwargs[k]
+                for k in (
+                    "force_download",
+                    "resume_download",
+                    "proxies",
+                    "token",
+                    "cache_dir",
+                    "local_files_only",
+                    "revision",
+                )
+                if k in kwargs
+            }
+            config = PreTrainedConfig.from_pretrained(path, **cfg_kw)
+            kwargs["config"] = config
+        prev = getattr(config, "device", None)
+        if hasattr(config, "device") and prev != "cpu":
+            config.device = "cpu"
+            print(
+                f"rocm-opt: load on CPU (was {prev!r}) then move to iGPU "
+                "(Strix Halo UMA)",
+                flush=True,
+            )
         policy = orig(cls, *args, **kwargs)
         return apply_rocm_pi05_optimizations(policy)
 
