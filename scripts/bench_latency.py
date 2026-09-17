@@ -47,7 +47,10 @@ def main() -> None:
     ]
     img_masks = [torch.ones(1, device=device, dtype=torch.bool) for _ in range(3)]
     tokens = torch.randint(1, 1000, (1, 200), device=device)
-    masks = torch.ones(1, 200, device=device, dtype=torch.bool)
+    # Real prompts fill only part of the padded 200-token stream (LIBERO-10 uses ~52).
+    lang_len = max(1, min(int(os.environ.get("PI05_BENCH_LANG_LEN", "52")), 200))
+    masks = torch.zeros(1, 200, device=device, dtype=torch.bool)
+    masks[:, :lang_len] = True
 
     def step():
         with torch.no_grad():

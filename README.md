@@ -6,10 +6,10 @@ Machine: AMD Ryzen AI Max+ / Radeon 8060S (`gfx1151`).
 
 | Metric | Value |
 |--------|--------|
-| E2E action chunk latency | **105 ms** (median; `scripts/bench_latency.py`, 1-NFE `sample_actions`) |
+| E2E action chunk latency | **104 ms** default, **89 ms** with `PI05_LANG_TOKENS=64` (median; `scripts/bench_latency.py`, 1-NFE `sample_actions`) |
 | LIBERO-10 accuracy | **20/20 = 100%** (2 episodes × 10 tasks, seed 0) |
 | `n_action_steps` / `num_inference_steps` | 10 / 1 |
-| Prefix tokens | 776 (batched SigLIP + empty-camera pool 256→64) |
+| Prefix tokens | 776 (batched SigLIP + empty-camera pool 256→64); **640** with `PI05_LANG_TOKENS=64` |
 
 Two episodes per task is a **smoke** for quantization/compile correctness, not a full 500-episode LIBERO score.
 
@@ -94,21 +94,33 @@ python scripts/libero_eval.py \
   --tasks libero_10 --episodes 2 --seed 0 \
   --n-inference-steps 1 --n-action-steps 10 \
   --output-dir eval_out/libero10_ep2
+
+# same command with prefix trimming (also 20/20)
+PI05_LANG_TOKENS=64 python scripts/libero_eval.py ... --output-dir eval_out/libero10_lang64
 ```
 
 Videos: `eval_out/libero10_ep2/videos/libero_10_{id}/eval_episode_{0,1}.mp4`
 
 `--resume` evaluates one task at a time (survives crashes; recompiles per task).
 
+When using `PI05_LANG_TOKENS`, check the log says `lang tokens trimmed to 64` and does
+**not** warn `instruction needs N tokens`: on that warning the prompt did not fit, the full
+200 tokens were used, and the run measured the default path rather than the trimmed one.
+
 ## Latency (synthetic, not sim)
 
 ```bash
 source env.sh
-python scripts/bench_latency.py
+
+python scripts/bench_latency.py                        # 104 ms
+PI05_LANG_TOKENS=64 python scripts/bench_latency.py    #  89 ms
 ```
 
 First call pays `torch.compile` autotune (minutes). Median after warmup is the number
-to compare (**105 ms** on 8060S).
+to compare (**104 ms** on 8060S, **89 ms** with `PI05_LANG_TOKENS=64`).
+
+The synthetic prompt fills 52 of the 200 padded language tokens, matching LIBERO-10
+(`PI05_BENCH_LANG_LEN` overrides it).
 
 `download_checkpoints.sh` rewrites SnapFlow `config.json` once (drops `_reflex_*`
 keys that stock LeRobot rejects). Later eval/bench runs are a no-op if already clean.
@@ -144,6 +156,8 @@ pi05-pytorch-fast/
 | `PI05_COMPILE_MODE` | `max-autotune-no-cudagraphs` | Inductor mode |
 | `PI05_PREFIX_LM_FP16` | `1` | Cast prefix LM to fp16 after W4A4 |
 | `PI05_W4A4_FUSE_QUANT` | `1` | Shared QKV / gate-up quant |
+| `PI05_INDUCTOR_GEMM_BACKENDS` | `ATEN` | Inductor GEMM backend. ROCm 10.1 disables the origami heuristic, so Inductor mis-ranks triton over hipBLASLt; `ATEN` is ~2% faster. Set empty to restore triton autotune |
+| `PI05_LANG_TOKENS` | unset (off) | Trim trailing **padded** language tokens to this bucket (prefix = 576 + N). Real tokens are never dropped: if the prompt does not fit, the full 200 are used and a warning is printed. `64` → prefix 640 = exactly 5 `gemm_iu4` `BM=128` tiles (−14% E2E, LIBERO-10 still 20/20) |
 | `SNAPFLOW_TEACHER_POLICY` | `~/model_data/pi05_libero_v044` | Processor json/safetensors |
 | `PALIGEMMA_TOKENIZER_PATH` | `~/model_data/paligemma2-3b-pt-224` | Local tokenizer |
 

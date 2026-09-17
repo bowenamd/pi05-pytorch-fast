@@ -122,6 +122,53 @@ def enable_prefix_lm_fp16(model) -> None:
     print(f"rocm-opt: prefix LM fp16 ({n} tensors; SigLIP/expert stay bf16)", flush=True)
 
 
+def _lang_token_budget() -> int:
+    raw = os.environ.get("PI05_LANG_TOKENS", "").strip()
+    if not raw:
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
+
+
+def install_lang_token_trim(model) -> bool:
+    """Drop trailing padded language tokens to a fixed bucket before the compiled call.
+
+    Shrinks prefill M (776 -> 576 + budget). Static bucket keeps one compiled shape.
+    Falls back to the full length if the instruction does not fit the bucket.
+    """
+    budget = _lang_token_budget()
+    if budget <= 0:
+        return False
+    orig = model.sample_actions
+    state = {"warned": False}
+
+    def _trimmed(images, img_masks, tokens, masks, *args, **kwargs):
+        n = tokens.shape[1]
+        if n > budget:
+            if bool(masks[:, budget:].any()):
+                if not state["warned"]:
+                    state["warned"] = True
+                    need = int(masks.sum(dim=1).max().item())
+                    print(
+                        f"rocm-opt: instruction needs {need} of {n} tokens > "
+                        f"PI05_LANG_TOKENS={budget}; using full {n}",
+                        flush=True,
+                    )
+            else:
+                tokens = tokens[:, :budget].contiguous()
+                masks = masks[:, :budget].contiguous()
+        return orig(images, img_masks, tokens, masks, *args, **kwargs)
+
+    model.sample_actions = _trimmed
+    print(
+        f"rocm-opt: lang tokens trimmed to {budget} (prefix {576 + budget} vs 776)",
+        flush=True,
+    )
+    return True
+
+
 def apply_rocm_pi05_optimizations(policy: Any, *, compile_model: bool | None = None) -> Any:
     """Mutate a loaded PI05Policy for gfx1151 PyTorch inference."""
     import torch
@@ -230,6 +277,8 @@ def apply_rocm_pi05_optimizations(policy: Any, *, compile_model: bool | None = N
                 compile_model = False
     elif not compile_model:
         print("rocm-opt: bf16 + batched SigLIP + eager attn (compile off)", flush=True)
+
+    install_lang_token_trim(model)
 
     if torch.cuda.is_available():
         _orig_pred = policy.predict_action_chunk
