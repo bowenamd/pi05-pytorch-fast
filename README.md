@@ -57,14 +57,15 @@ Set `HSA_OVERRIDE_GFX_VERSION=11.5.1` if the runtime does not detect gfx1151.
 ```bash
 cd pi05-pytorch-fast
 
-# 1) Weights + tokenizer + LIBERO sim (clones if missing)
+# 1) Venv (does not touch onnx-infer / pi05-migraphx)
+ROCM_ARCH=gfx1151 bash scripts/setup.sh -y
+source env.sh
+
+# 2) Weights + tokenizer + LIBERO sim (clones if missing)
+# Must run after setup.sh: it needs the `hf` CLI installed into the venv.
 bash scripts/download_checkpoints.sh all
 # Needs HF token for gated paligemma tokenizer if google/paligemma2-3b-pt-224 is gated.
 # LIBERO defaults to ~/model_data/libero; reuses ~/openpi/third_party/libero when present.
-
-# 2) Venv (does not touch onnx-infer / pi05-migraphx)
-ROCM_ARCH=gfx1151 bash scripts/setup.sh -y
-source env.sh
 ```
 
 If you already have `~/.local/venvs/pi05-migraphx` from the parent project, you *can*

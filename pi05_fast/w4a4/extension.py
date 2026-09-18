@@ -16,25 +16,53 @@ def load_int4_gemm():
     if _mod is not None:
         return _mod
 
-    from torch.utils.cpp_extension import load
-
-    os.environ.setdefault("PYTORCH_ROCM_ARCH", os.environ.get("GPU_ARCHS", "gfx1151"))
-    os.environ.setdefault("ROCM_PATH", "/opt/rocm")
-    os.environ.setdefault("HIP_PATH", "/opt/rocm")
-    csrc = Path(__file__).resolve().parent / "csrc"
     import _rocm_sdk_core
 
-    rocm_lib = Path(_rocm_sdk_core.__file__).resolve().parent / "lib"
+    sdk_root = Path(_rocm_sdk_core.__file__).resolve().parent
+    if "ROCM_PATH" in os.environ:
+        rocm_root = Path(os.environ["ROCM_PATH"])
+    else:
+        # Prefer the rocm-sdk-devel tree shipped inside the venv over any host
+        # install (full ROCm root: llvm, amdgcn bitcode, thrust/rocprim headers).
+        try:
+            import _rocm_sdk_devel
+
+            rocm_root = Path(_rocm_sdk_devel.__file__).resolve().parent
+        except ImportError:
+            rocm_root = sdk_root
+    if not (rocm_root / "lib" / "llvm" / "bin" / "clang++").is_file():
+        rocm_root = Path("/opt/rocm")
+
+    os.environ.setdefault("PYTORCH_ROCM_ARCH", os.environ.get("GPU_ARCHS", "gfx1151"))
+    os.environ["ROCM_PATH"] = str(rocm_root)
+    os.environ["HIP_PATH"] = str(rocm_root)
+
+    # Imported here: cpp_extension resolves ROCM_HOME once at module import time.
+    from torch.utils.cpp_extension import load
+
+    csrc = Path(__file__).resolve().parent / "csrc"
+
+    rocm_lib = sdk_root / "lib"
     link_dir = Path("/tmp/pi05_fast_w4a4_rocm_lib")
     link_dir.mkdir(parents=True, exist_ok=True)
     soname = rocm_lib / "libamdhip64.so.7"
     link = link_dir / "libamdhip64.so"
     if soname.is_file() and not link.exists():
         link.symlink_to(soname)
+    cuda_cflags = ["-O3", "-std=c++20", f"--rocm-path={rocm_root}"]
+    for device_libs in (
+        rocm_root / "amdgcn" / "bitcode",
+        rocm_root / "lib" / "llvm" / "amdgcn" / "bitcode",
+    ):
+        if device_libs.is_dir():
+            cuda_cflags.append(f"--rocm-device-lib-path={device_libs}")
+            break
+    if (rocm_root / "include" / "thrust").is_dir():
+        cuda_cflags.append(f"-isystem{rocm_root / 'include'}")
     _mod = load(
         name="pi05_fast_w4a4_int4",
         sources=[str(csrc / "int4_gemm.cu")],
-        extra_cuda_cflags=["-O3", "-std=c++20", "--rocm-path=/opt/rocm"],
+        extra_cuda_cflags=cuda_cflags,
         extra_cflags=["-O3", "-std=c++20"],
         extra_ldflags=[f"-L{link_dir}", f"-L{rocm_lib}", f"-Wl,-rpath,{rocm_lib}"],
         verbose=os.environ.get("PI05_W4A4_VERBOSE", "0") == "1",
