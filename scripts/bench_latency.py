@@ -62,6 +62,7 @@ def main() -> None:
         step()
     torch.cuda.synchronize()
     times = []
+    print("timed loop start", flush=True)
     for _ in range(n):
         torch.cuda.synchronize()
         t0 = time.perf_counter()

@@ -128,6 +128,56 @@ The synthetic prompt fills 52 of the 200 padded language tokens, matching LIBERO
 `download_checkpoints.sh` rewrites SnapFlow `config.json` once (drops `_reflex_*`
 keys that stock LeRobot rejects). Later eval/bench runs are a no-op if already clean.
 
+## Resource utilization (CPU / GPU / DRAM)
+
+`scripts/monitor_util.py` runs any command as a child process and samples every
+100 ms. It only reads `/proc` and amdgpu sysfs: no root, no `rocprofv3`, no
+change to the measured process.
+
+```bash
+source env.sh
+
+# 1) Monitor the fast config. Summary is printed for the timed loop only.
+PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1 PI05_BENCH_ITERS=400 \
+    python scripts/monitor_util.py --csv eval_out/util/bench_fast.csv -- \
+    python scripts/bench_latency.py
+
+# 2) Line charts: full run (timed loop shaded green) and timed loop only.
+python scripts/plot_util.py eval_out/util/bench_fast.csv            # -> bench_fast.all.png
+python scripts/plot_util.py eval_out/util/bench_fast.csv --phase steady   # -> bench_fast.steady.png
+```
+
+Use `PI05_BENCH_ITERS=400` (~30 s) so the window is much longer than the 1 s SMU
+filter. The `phase` column is `startup` (load + compile + warmup) → `steady`
+(between the `timed loop start` and `n=...` lines of `bench_latency.py`) → `done`.
+The summary drops the first `--skip-after-start` seconds (default 2) of `steady`.
+To wrap another command, set `--start-marker` / `--end-marker` (regex on its stdout).
+
+| Column | Source |
+|--------|--------|
+| `sys_cpu_pct` | `psutil.cpu_percent()` (`/proc/stat`), whole machine |
+| `proc_cpu_pct` | `psutil` per-process CPU summed over the process tree (100 = 1 core) |
+| `proc_rss_mb`, `host_mem_used_mb` | `psutil` RSS / `virtual_memory()` (unified memory: RSS includes GPU-mapped pages) |
+| `gpu_busy_pct` | sysfs `gpu_busy_percent` |
+| `vram_used_mb`, `gtt_used_mb` | sysfs `mem_info_vram_used` / `mem_info_gtt_used` |
+| `gfx_activity`, `dram_reads/writes` (MB/s), `*_power` (W), `gfxclk/fclk/uclk` (MHz) | sysfs `gpu_metrics` parsed as `struct gpu_metrics_v3_0` (`kgd_pp_interface.h`) |
+
+`gpu_metrics` values are SMU time-filtered (~1 s), so they show averages, not
+per-inference phases (use `rocprofv3` counters for per-kernel detail). DRAM
+bandwidth is SoC-wide (CPU + GPU); `dram_bw_pct` is relative to the 256 GB/s
+LPDDR5X-8000 x 256-bit spec, not a measured peak. `amd-smi metric` reports N/A
+for most of these on gfx1151, hence the direct sysfs read.
+
+Measured on 8060S, fast config (81 ms median), timed loop:
+
+| Metric | Mean |
+|--------|------|
+| GPU busy | 98.8% (GPU-bound, no launch gaps) |
+| CPU | ~2 cores (6.7% of 32 logical) |
+| DRAM bandwidth | 74.6 GB/s (46.7 read + 27.9 write) ≈ 29% of spec, ~6 GB / inference |
+| Memory | host used 39 GB, process RSS 23 GB, GTT 6.8 GB, VRAM 1.3 GB |
+| Power | socket 140 W, gfx 55 W, gfxclk 2900 MHz |
+
 ## Layout
 
 ```
@@ -147,7 +197,9 @@ pi05-pytorch-fast/
     ├── download_checkpoints.sh
     ├── pack_w4a4_prefix.py
     ├── libero_eval.py
-    └── bench_latency.py
+    ├── bench_latency.py
+    ├── monitor_util.py         # CPU/GPU/DRAM sampler -> CSV + summary
+    └── plot_util.py            # CSV -> line charts
 ```
 
 ## Environment knobs
