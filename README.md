@@ -142,16 +142,27 @@ PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1 PI05_BENCH_ITERS=400 \
     python scripts/monitor_util.py --csv eval_out/util/bench_fast.csv -- \
     python scripts/bench_latency.py
 
-# 2) Line charts: full run (timed loop shaded green) and timed loop only.
+# 2) Line charts: full run (each phase shaded) and timed loop only.
 python scripts/plot_util.py eval_out/util/bench_fast.csv            # -> bench_fast.all.png
 python scripts/plot_util.py eval_out/util/bench_fast.csv --phase steady   # -> bench_fast.steady.png
 ```
 
 Use `PI05_BENCH_ITERS=400` (~30 s) so the window is much longer than the 1 s SMU
-filter. The `phase` column is `startup` (load + compile + warmup) → `steady`
-(between the `timed loop start` and `n=...` lines of `bench_latency.py`) → `done`.
-The summary drops the first `--skip-after-start` seconds (default 2) of `steady`.
-To wrap another command, set `--start-marker` / `--end-marker` (regex on its stdout).
+filter. Each sample's `phase` is set by `bench_latency.py` stdout lines:
+
+| Phase | Starts at line | What runs |
+|-------|----------------|-----------|
+| `init` | process start | Python/torch imports, checkpoint sanitize, hook install |
+| `load` | `loading ...` | `PI05Policy.from_pretrained`, W4A4 pack load + Linear swap, move to GPU |
+| `compile` | `warmup / compile...` | first `sample_actions` call: `torch.compile` + max-autotune |
+| `warmup` | `first call done` | remaining `PI05_BENCH_WARMUP - 1` calls |
+| `steady` | `timed loop start` | timed loop (the latency number) |
+| `done` | `n=...` | result print, teardown |
+
+The monitor prints a per-phase table and a detailed `steady` summary, dropping
+the first `--skip-after-start` seconds (default 2) of `steady`. To wrap another
+command, set `--start-marker` / `--end-marker` (regex on its stdout for
+`steady` / `done`); markers that never appear are skipped.
 
 | Column | Source |
 |--------|--------|
@@ -168,7 +179,21 @@ bandwidth is SoC-wide (CPU + GPU); `dram_bw_pct` is relative to the 256 GB/s
 LPDDR5X-8000 x 256-bit spec, not a measured peak. `amd-smi metric` reports N/A
 for most of these on gfx1151, hence the direct sysfs read.
 
-Measured on 8060S, fast config (81 ms median), timed loop:
+Measured on 8060S, fast config (81 ms median), per phase (warm Inductor cache;
+a cold first compile takes minutes):
+
+| Phase | Start (s) | Duration (s) | CPU mean / peak (cores) | GPU busy (%) | DRAM (GB/s) | RSS end (GB) | GTT end (GB) |
+|-------|----------:|-------------:|------------------------:|-------------:|------------:|-------------:|-------------:|
+| init | 0.0 | 3.3 | 3.4 / 24.1 | 0.0 | 1.5 | 1.0 | 0.0 |
+| load | 3.3 | 63.7 | 2.8 / 31.3 | 0.7 | 6.0 | 6.7 | 5.7 |
+| compile | 67.0 | 23.0 | 1.6 / 26.7 | 7.4 | 5.1 | 22.6 | 6.6 |
+| warmup | 90.0 | 0.6 | 2.0 / 2.1 | 45.0 | 25.0 | 22.6 | 6.6 |
+| steady | 90.6 | 32.3 | 2.0 / 2.2 | 97.7 | 73.3 | 22.6 | 6.6 |
+| done | 122.9 | 2.6 | 1.9 / 2.1 | 35.9 | 27.6 | 0.0 | 0.1 |
+| **total** | | **125.5** | | | | | |
+
+GPU/DRAM means of short phases (`warmup`, `done`) and the start of `steady` are
+smeared by the 1 s SMU filter. Timed loop (`steady`, first 2 s dropped):
 
 | Metric | Mean |
 |--------|------|

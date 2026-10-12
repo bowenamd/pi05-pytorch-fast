@@ -58,7 +58,11 @@ def main() -> None:
 
     print("warmup / compile...", flush=True)
     torch.cuda.synchronize()
-    for _ in range(w):
+    # First call triggers torch.compile + autotune; later calls are pure warmup.
+    step()
+    torch.cuda.synchronize()
+    print("first call done", flush=True)
+    for _ in range(w - 1):
         step()
     torch.cuda.synchronize()
     times = []

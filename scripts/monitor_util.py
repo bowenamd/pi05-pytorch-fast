@@ -3,8 +3,9 @@
 
   python scripts/monitor_util.py --csv eval_out/util.csv -- python scripts/bench_latency.py
 
-Samples taken between the start/end marker lines of the child's stdout form the
-"steady" window that is summarized (default markers match bench_latency.py).
+The child's stdout lines switch the sample phase (defaults match bench_latency.py):
+init -> load -> compile -> warmup -> steady -> done. A per-phase table is printed,
+plus a detailed summary of the "steady" window.
 """
 
 from __future__ import annotations
@@ -29,6 +30,14 @@ _GM = {
     "gfx_activity": 22, "dram_reads": 48, "dram_writes": 49, "socket_power": 53,
     "apu_power": 55, "gfx_power": 56, "gfxclk": 78, "fclk": 82, "uclk": 84,
 }
+# (phase entered, stdout regex) in order; "init" is the phase before any marker.
+PHASE_MARKERS = [
+    ("load", r"^loading "),
+    ("compile", r"^warmup / compile"),
+    ("warmup", r"^first call done"),
+    ("steady", r"^timed loop start"),
+    ("done", r"^n=\d+"),
+]
 # LPDDR5X-8000 x 256-bit (Strix Halo).
 DRAM_PEAK_MBPS = 256_000
 
@@ -70,7 +79,8 @@ class Sampler(threading.Thread):
         self.interval = interval
         self.dev = _find_gpu()
         self.rows: list[dict] = []
-        self.phase = "startup"
+        self.phase = "init"
+        self.t0 = time.perf_counter()
         self.stop_evt = threading.Event()
         self._procs: dict[int, psutil.Process] = {}
 
@@ -101,12 +111,11 @@ class Sampler(threading.Thread):
     def run(self) -> None:
         psutil.cpu_percent(None)
         self._proc_tree_cpu()
-        t0 = time.perf_counter()
         while not self.stop_evt.wait(self.interval):
             tree_cpu, main_cpu, rss = self._proc_tree_cpu()
             vm = psutil.virtual_memory()
             row = {
-                "t": time.perf_counter() - t0,
+                "t": time.perf_counter() - self.t0,
                 "phase": self.phase,
                 "sys_cpu_pct": psutil.cpu_percent(None),
                 "proc_cpu_pct": tree_cpu,
@@ -117,6 +126,25 @@ class Sampler(threading.Thread):
             }
             row.update(_gpu_sample(self.dev))
             self.rows.append(row)
+
+
+def _phase_table(rows: list[dict], transitions: list[tuple[str, float]], t_end: float) -> None:
+    print("\n[monitor] phases")
+    print("| Phase | Start (s) | Duration (s) | CPU mean / peak (cores) | GPU busy mean (%) "
+          "| DRAM mean (GB/s) | RSS end (GB) | GTT end (GB) |")
+    print("|---|---:|---:|---:|---:|---:|---:|---:|")
+    bounds = transitions + [("", t_end)]
+    for (name, t0), (_, t1) in zip(bounds, bounds[1:]):
+        rs = [r for r in rows if r["phase"] == name]
+        if not rs:
+            print(f"| {name} | {t0:.1f} | {t1 - t0:.1f} | - | - | - | - | - |")
+            continue
+        cpu = [r["proc_cpu_pct"] / 100 for r in rs]
+        print(f"| {name} | {t0:.1f} | {t1 - t0:.1f} | {statistics.fmean(cpu):.1f} / {max(cpu):.1f} "
+              f"| {statistics.fmean(r['gpu_busy_pct'] for r in rs):.1f} "
+              f"| {statistics.fmean(r.get('dram_total_mbps', 0) for r in rs) / 1000:.1f} "
+              f"| {rs[-1]['proc_rss_mb'] / 1024:.1f} | {rs[-1]['gtt_used_mb'] / 1024:.1f} |")
+    print(f"| total | 0.0 | {t_end:.1f} | | | | | |", flush=True)
 
 
 def _summarize(rows: list[dict], ncpu: int) -> None:
@@ -152,15 +180,20 @@ def main() -> None:
     child = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
     s = Sampler(child.pid, a.interval)
     s.start()
-    start_re, end_re = re.compile(a.start_marker), re.compile(a.end_marker)
-    t_start = t_end = None
+    overrides = {"steady": a.start_marker, "done": a.end_marker}
+    pending = [(name, re.compile(overrides.get(name, rx))) for name, rx in PHASE_MARKERS]
+    transitions = [("init", 0.0)]
     for line in child.stdout:
         sys.stdout.write(line)
-        if t_start is None and start_re.search(line):
-            s.phase, t_start = "steady", time.perf_counter()
-        elif t_start is not None and t_end is None and end_re.search(line):
-            s.phase, t_end = "done", time.perf_counter()
+        # Markers may be skipped (other commands), but phases never go backwards.
+        for i, (name, rx) in enumerate(pending):
+            if rx.search(line):
+                s.phase = name
+                transitions.append((name, time.perf_counter() - s.t0))
+                del pending[: i + 1]
+                break
     rc = child.wait()
+    t_end = time.perf_counter() - s.t0
     s.stop_evt.set()
     s.join()
 
@@ -173,6 +206,7 @@ def main() -> None:
             w.writerows(s.rows)
         print(f"[monitor] wrote {len(s.rows)} samples -> {a.csv}", flush=True)
 
+    _phase_table(s.rows, transitions, t_end)
     steady = [r for r in s.rows if r["phase"] == "steady"]
     if steady:
         t0 = steady[0]["t"] + a.skip_after_start

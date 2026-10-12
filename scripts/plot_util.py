@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Plot a monitor_util.py CSV as stacked time-series (steady window shaded).
+"""Plot a monitor_util.py CSV as stacked time-series (phases shaded).
 
   python scripts/plot_util.py eval_out/util/bench_fast.csv [--phase steady] [-o out.png]
 """
@@ -43,17 +43,27 @@ def main() -> None:
         ("Power (W)", [("socket", col("socket_power")), ("gfx", col("gfx_power"))]),
     ]
     fig, axes = plt.subplots(len(panels), 1, figsize=(12, 2.2 * len(panels)), sharex=True)
-    steady = [x for x, r in zip(t, rows) if r["phase"] == "steady"]
+    spans: list[list] = []
+    for x, r in zip(t, rows):
+        if spans and spans[-1][0] == r["phase"]:
+            spans[-1][2] = x
+        else:
+            spans.append([r["phase"], x, x])
+    colors = plt.get_cmap("Pastel1").colors
     for ax, (title, series) in zip(axes, panels):
         for label, ys in series:
             ax.plot(t, ys, lw=1, label=label)
-        if steady and not a.phase:
-            ax.axvspan(steady[0], steady[-1], color="tab:green", alpha=0.12)
+        if not a.phase:
+            for i, (name, x0, x1) in enumerate(spans):
+                ax.axvspan(x0, x1, color=colors[i % len(colors)], alpha=0.5, lw=0)
+                if ax is axes[0]:
+                    ax.text((x0 + x1) / 2, 1.02, name, transform=ax.get_xaxis_transform(),
+                            ha="center", va="bottom", fontsize=8)
         ax.set_ylabel(title)
         ax.grid(alpha=0.3)
         ax.legend(loc="upper left", fontsize=8, ncol=len(series))
-    axes[-1].set_xlabel("time (s)" + ("" if a.phase else "   [green = steady timed loop]"))
-    fig.suptitle(f"{a.csv.name}" + (f" ({a.phase})" if a.phase else ""))
+    axes[-1].set_xlabel("time (s)")
+    fig.suptitle(f"{a.csv.name}" + (f" ({a.phase})" if a.phase else ""), y=1.0)
     fig.tight_layout()
     out = a.out or a.csv.with_suffix(f".{a.phase or 'all'}.png")
     fig.savefig(out, dpi=110)
