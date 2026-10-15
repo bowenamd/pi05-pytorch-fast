@@ -128,6 +128,44 @@ The synthetic prompt fills 52 of the 200 padded language tokens, matching LIBERO
 `download_checkpoints.sh` rewrites SnapFlow `config.json` once (drops `_reflex_*`
 keys that stock LeRobot rejects). Later eval/bench runs are a no-op if already clean.
 
+## Output fidelity vs. baseline (cosine similarity)
+
+`scripts/compare_cosine.py` feeds identical real LIBERO inputs and fixed noise to each
+config, then compares the action chunks with a baseline (normalized actions, 7 dims x 50 steps).
+
+```bash
+source env.sh
+D=eval_out/cosine
+
+# 1) Record real model inputs from LIBERO-10 rollouts (1 ep/task, every 3rd call -> 83 samples)
+python scripts/compare_cosine.py capture --out $D/inputs.pt
+
+# 2) Dump actions, one process per config (env knobs select the config)
+python scripts/compare_cosine.py dump --upstream --dtype float32 --out $D/ref_fp32.pt   # stock lerobot fp32
+python scripts/compare_cosine.py dump --upstream --out $D/upstream_bf16.pt              # stock lerobot bf16
+PI05_W4A4_PACK= PI05_COMPILE=0 PI05_PREFIX_LAYOUT=openpi \
+    python scripts/compare_cosine.py dump --out $D/rocm_bf16_eager.pt
+python scripts/compare_cosine.py dump --out $D/rocm_w4a4.pt                             # default
+PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1 \
+    python scripts/compare_cosine.py dump --out $D/fast.pt
+
+# 3) Compare against the fp32 baseline (also writes JSON)
+python scripts/compare_cosine.py compare --ref $D/ref_fp32.pt --json $D/vs_ref_fp32.json \
+    $D/upstream_bf16.pt $D/rocm_bf16_eager.pt $D/rocm_w4a4.pt $D/fast.pt
+```
+
+Measured 2026-10-15 (83 samples, ref = stock lerobot fp32):
+
+| Config | cos mean | cos min | cos P5 | relL2 |
+|---|---|---|---|---|
+| stock lerobot bf16 | 0.99996 | 0.99975 | 0.99991 | 0.8% |
+| ROCm bf16 eager | 0.99995 | 0.99982 | 0.99988 | 1.0% |
+| W4A4 + compile (default) | 0.98751 | 0.87691 | 0.97079 | 14.8% |
+| fast (W4A4 + `LANG_TOKENS=64` + `CACHE_EMPTY_CAM=1`) | 0.98791 | 0.86084 | 0.96810 | 14.4% |
+
+Nearly all deviation comes from W4A4 on the prefix LM; bf16/compile/layout changes are
+lossless (>= 0.9999), and token trimming/camera cache add none.
+
 ## Resource utilization (CPU / GPU / DRAM)
 
 `scripts/monitor_util.py` runs any command as a child process and samples every
@@ -223,6 +261,7 @@ pi05-pytorch-fast/
     ├── pack_w4a4_prefix.py
     ├── libero_eval.py
     ├── bench_latency.py
+    ├── compare_cosine.py       # action cosine similarity vs. baseline
     ├── monitor_util.py         # CPU/GPU/DRAM sampler -> CSV + summary
     └── plot_util.py            # CSV -> line charts
 ```
