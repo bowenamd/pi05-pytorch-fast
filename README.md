@@ -1,12 +1,22 @@
 # Fastest gfx1151 PyTorch recipe for OpenPI π0.5 SnapFlow (1-NFE)
 
-## Optional SnapFlow training
+## SnapFlow distillation from a fresh machine
 
-[distill/snapflow](distill/snapflow/README.md) contains a standalone pi0.5
-distillation component extracted from Tether, with a from-zero conda installer,
-pinned teacher/dataset downloads, a 100-step validation entrypoint, and loss reports.
-It requires no Tether checkout or personal fork. Extracted code retains its
-[BUSL-1.1 license](distill/snapflow/LICENSE); the inference setup below is separate.
+Follow the **[complete SnapFlow distillation guide](distill/snapflow/DISTILLATION.md)**
+to start from a fresh Ubuntu 24.04 AMD GPU machine: install the GPU driver and
+Anaconda, create a new conda environment with pinned ROCm 10.1 / PyTorch 2.15
+nightly dependencies, download the teacher/tokenizer/LIBERO data, run 100 training
+steps, and inspect the loss report. The guide also covers longer training,
+checkpoint loading, and an alternative Ubuntu ROCm container workflow.
+
+[Validation results](distill/snapflow/VERIFICATION.md) record the fresh conda setup
+and successful 100-step training. [Container image details](distill/snapflow/IMAGES.md)
+record the available images and their versions; the container workflow is documented
+but has not been validated locally.
+
+The standalone component requires no Tether checkout or personal fork. Extracted
+code retains its [BUSL-1.1 license](distill/snapflow/LICENSE); the inference setup
+below is separate.
 
 ## Published 10,000-step student
 
@@ -23,7 +33,7 @@ This release uses the converted LIBERO-90 mix teacher and **QUANTILES**
 normalization. Keep its packaged processors and tokenizer together with the
 weights. The existing latency/LIBERO measurements below retain their original
 reference-checkpoint provenance. See the model card and
-[standalone loading instructions](distill/snapflow/README.md#7-download-the-published-10000-step-student)
+[standalone loading instructions](distill/snapflow/DISTILLATION.md#7-download-the-published-10000-step-student)
 for this release's provenance and target-time-aware 1-NFE loading.
 
 ## Measured results (2026-09-02)

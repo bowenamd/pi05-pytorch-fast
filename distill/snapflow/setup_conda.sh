@@ -24,7 +24,7 @@ EOF
 fi
 if [[ $# != 0 ]]; then echo "Unknown arguments; use --help" >&2; exit 2; fi
 if ! command -v "${CONDA_BIN}" >/dev/null 2>&1; then
-    echo "Install Anaconda/conda first; see distill/snapflow/README.md" >&2; exit 1
+    echo "Install Anaconda/conda first; see distill/snapflow/DISTILLATION.md" >&2; exit 1
 fi
 if [[ "$(uname -s)" != Linux || "$(uname -m)" != x86_64 ]]; then
     echo "This pinned ROCm recipe requires Linux x86_64" >&2; exit 1

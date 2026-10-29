@@ -315,7 +315,7 @@ at revision `af13ddd7bbd028f81cb52645ae676efba2a98f3b`, converted from OpenPI
 checkpoint `pi05_l90mix_pretrain_bs64_lr2.5e-5_10k/9999`. Distillation used the
 original `lerobot/libero` v3 input, batch 4, LR 1e-4, seed 42, and bf16.
 The model uses **QUANTILES** normalization from that teacher. The default
-from-zero recipe in this README uses the different `pi05_libero_finetuned_v044`
+from-zero recipe in this guide uses the different `pi05_libero_finetuned_v044`
 teacher; it describes a fresh experiment and does not promise to recreate this
 published checkpoint. Detailed provenance and input/model terms are in the
 Hub model card.
