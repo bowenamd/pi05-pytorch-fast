@@ -1,0 +1,10 @@
+{
+  "source": "FastCrest/tether",
+  "commit": "6b0e07e5c7516a17079cb381fa59588ad5cdd8f5",
+  "license": "BUSL-1.1",
+  "files": {
+    "src/tether/distill/snapflow.py": "10ef276daa86e1734b6f5777689b1ea50b03ee5444fef20eae796073182049dd",
+    "src/tether/distill/snapflow_pi0_model.py": "4c64275b411f9bb9b1c9e43df208f46616b67ff0f4ee7c28524379af4a7ffc3f",
+    "src/tether/finetune/backends/snapflow_backend.py": "4b2f13cb03c78363fab0cf2ac0b54f795a28931ace18fbff0c714460adf26b32"
+  }
+}
