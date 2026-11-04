@@ -277,6 +277,50 @@ smeared by the 1 s SMU filter. Timed loop (`steady`, first 2 s dropped):
 | Memory | host used 39 GB, process RSS 23 GB, GTT 6.8 GB, VRAM 1.3 GB |
 | Power | socket 140 W, gfx 55 W, gfxclk 2900 MHz |
 
+## Memory traffic vs. compute per kernel (rocprofv3)
+
+`scripts/profile_mem_compute.py` profiles the steady-state 1-NFE path (each phase
+compiled separately, kernels tagged `vision` / `llm` / `denoiser` with roctx ranges)
+and joins one timing pass with four hardware-counter passes per kernel dispatch.
+An optional thread-trace (ATT) pass shows, at instruction level, whether compute
+issues while global loads are outstanding.
+
+```bash
+source env.sh
+export PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1
+# ~12 min (5 passes). Add --att-lib <dir with librocprof-trace-decoder.so> for the ATT pass.
+python scripts/profile_mem_compute.py collect --out eval_out/memcompute
+python scripts/profile_mem_compute.py report  --out eval_out/memcompute
+# -> summary.md, phases.csv, kernel_summary.csv, kernels.csv (per dispatch),
+#    timeline.png, att.csv, trace/r_results.pftrace (open in ui.perfetto.dev)
+```
+
+| Metric | Counters | Meaning |
+|--------|----------|---------|
+| `fabric_GBs` | `GL2C_EA_RDREQ_{32,64,96,128}B`, `GL2C_MC_WRREQ`, `GL2C_EA_WRREQ_64B` | L2-miss traffic / kernel time. Served by the 32 MB MALL **or** DRAM; no per-kernel counter separates them |
+| `mem_unit_busy_pct` | `MemUnitBusy` (TA busy / GPU busy) | time the vector memory pipeline has work, incl. stalls |
+| `valu_issue_pct` | `SQ_INSTS_VALU / (SIMDs x GRBM_GUI_ACTIVE)` | VALU issue rate; lower bound on ALU activity (one WMMA counts once but occupies many cycles) |
+| `wave_wait_pct` | `SQ_WAIT_ANY / SQ_WAVE_CYCLES` | share of wave time spent waiting |
+| ATT `valu_during_load_pct` | thread trace, traced SIMD | VALU/WMMA instructions issued while a global load is outstanding (`_definite`: load proven in flight because its `s_waitcnt vmcnt` stalled) |
+| ATT `exposed_mem_wait_pct` | thread trace | time every resident wave on the SIMD is blocked on `s_waitcnt vmcnt`, i.e. memory latency not hidden by compute |
+
+Counter passes serialize kernels, so timings come from the counter-free pass. Kernels on
+one stream never overlap each other; overlap of memory and compute happens **inside** a
+kernel, across waves. Measured 2026-11-04, fast config, 79.8 ms GPU time/iteration:
+
+| Phase | GPU ms | L2-miss read / write MB | GB/s | Mem unit busy | VALU issue |
+|-------|-------:|------------------------:|-----:|--------------:|-----------:|
+| vision | 18.2 | 2111 / 378 | 137 | 66% | 8% |
+| llm | 54.5 | 11781 / 1655 | 246 | 87% | 16% |
+| denoiser | 7.0 | 1088 / 1 | 155 | 71% | 2% |
+
+The 1 GB copy probe reaches 199 GB/s, but `gemm_iu4` sustains 268 GB/s of L2-miss
+traffic: part of the weight/activation re-reads hit the MALL. (The SoC-wide DRAM
+average from `monitor_util.py` is 75 GB/s.) ATT on the first LLM layer's 6 `gemm_iu4`
+calls: loads are outstanding 75-99% of the time, 67-99% of WMMA/VALU instructions issue
+while loads are outstanding (9-67% provably), and only 3-15% of time is exposed memory
+wait.
+
 ## Layout
 
 ```
@@ -299,6 +343,7 @@ pi05-pytorch-fast/
     ├── bench_latency.py
     ├── compare_cosine.py       # action cosine similarity vs. baseline
     ├── monitor_util.py         # CPU/GPU/DRAM sampler -> CSV + summary
+    ├── profile_mem_compute.py  # per-kernel L2-miss traffic vs compute (rocprofv3)
     └── plot_util.py            # CSV -> line charts
 ```
 
