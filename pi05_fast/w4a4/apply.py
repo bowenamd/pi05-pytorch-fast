@@ -8,6 +8,7 @@ from typing import Iterable
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from pi05_fast.w4a4.linear import W4A4Linear
 from pi05_fast.w4a4.pack import should_rotate
@@ -81,9 +82,11 @@ def apply_w4a4_from_dir(model: nn.Module, pack_dir: str | Path) -> int:
     preload()
     n = replace_linears_from_packed(model, packed, meta["layers"], device=device)
     n_fuse = fuse_shared_activation_quant(model)
+    n_glu = sum(1 for m in model.modules() if getattr(m, "_w4a4_glu", False))
     print(
         f"w4a4: replaced {n} Linear modules from {pack_dir}; "
-        f"shared-quant fused {n_fuse} QKV/MLP groups",
+        f"shared-quant fused {n_fuse} QKV/MLP groups; "
+        f"kernel={os.environ.get('PI05_W4A4_KERNEL', 'v1')} gelu-fused MLPs={n_glu}",
         flush=True,
     )
     return n
@@ -95,11 +98,14 @@ def _as_fp16_contig(x: torch.Tensor) -> torch.Tensor:
 
 
 def _fused_mlp_forward(self, x: torch.Tensor) -> torch.Tensor:
-    from pi05_fast.w4a4.extension import int4_gemm, int4_gemm2
+    from pi05_fast.w4a4.extension import int4_gemm, int4_gemm2, int4_gemm_glu
 
     xf = _as_fp16_contig(x)
-    gate, up = int4_gemm2(xf, self.gate_proj.packed, self.up_proj.packed)
-    h = self.act_fn(gate) * up
+    if getattr(self, "_w4a4_glu", False):
+        h = int4_gemm_glu(xf, self.gate_proj.packed, self.up_proj.packed)
+    else:
+        gate, up = int4_gemm2(xf, self.gate_proj.packed, self.up_proj.packed)
+        h = self.act_fn(gate) * up
     if not h.is_contiguous():
         h = h.contiguous()
     y = int4_gemm(h, self.down_proj.packed)
@@ -155,6 +161,26 @@ def _fused_attn_forward(
     return attn_output, attn_weights
 
 
+def _is_gelu_tanh(act) -> bool:
+    x = torch.linspace(-8, 8, 4001)
+    try:
+        return torch.allclose(act(x), F.gelu(x, approximate="tanh"), rtol=0, atol=1e-6)
+    except Exception:
+        return False
+
+
+def _glu_fusable(mod: nn.Module) -> bool:
+    g, u = mod.gate_proj.packed, mod.up_proj.packed
+    k = mod.gate_proj.in_features
+    return (
+        os.environ.get("PI05_W4A4_GLU", "0") == "1"
+        and g.shape == u.shape
+        and g.shape[1] == k // 8 + 4
+        and g.shape[0] % 64 == 0
+        and _is_gelu_tanh(mod.act_fn)
+    )
+
+
 def fuse_shared_activation_quant(model: nn.Module) -> int:
     """One activation quant for QKV and for gate/up (same x, several GEMMs)."""
     if os.environ.get("PI05_W4A4_FUSE_QUANT", "1") == "0":
@@ -172,6 +198,7 @@ def fuse_shared_activation_quant(model: nn.Module) -> int:
             getattr(mod, "down_proj", None),
         )
         if all(isinstance(p, W4A4Linear) for p in gate_up) and hasattr(mod, "act_fn"):
+            mod._w4a4_glu = _glu_fusable(mod)
             mod.forward = types.MethodType(_fused_mlp_forward, mod)
             n += 1
     return n

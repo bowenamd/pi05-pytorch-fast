@@ -75,7 +75,7 @@ def _register_custom_op() -> None:
     if _op_registered:
         return
     try:
-        torch.ops.pi05_w4a4.int4_gemm3
+        torch.ops.pi05_w4a4.int4_gemm_glu
         _op_registered = True
         return
     except (AttributeError, RuntimeError):
@@ -114,6 +114,14 @@ def _register_custom_op() -> None:
     ):
         return _fake_out(x, w0), _fake_out(x, w1), _fake_out(x, w2)
 
+    @torch.library.custom_op("pi05_w4a4::int4_gemm_glu", mutates_args=())
+    def _int4_gemm_glu(x: torch.Tensor, wg: torch.Tensor, wu: torch.Tensor) -> torch.Tensor:
+        return load_int4_gemm().int4_gemm_glu(x, wg, wu)
+
+    @_int4_gemm_glu.register_fake
+    def _int4_gemm_glu_fake(x: torch.Tensor, wg: torch.Tensor, wu: torch.Tensor) -> torch.Tensor:
+        return _fake_out(x, wg)
+
     _op_registered = True
 
 
@@ -129,6 +137,11 @@ def int4_gemm2(
     x: torch.Tensor, w0: torch.Tensor, w1: torch.Tensor
 ) -> tuple[torch.Tensor, torch.Tensor]:
     return torch.ops.pi05_w4a4.int4_gemm2(x, w0, w1)
+
+
+def int4_gemm_glu(x: torch.Tensor, wg: torch.Tensor, wu: torch.Tensor) -> torch.Tensor:
+    """fp16 gelu_tanh(x @ Wg^T) * (x @ Wu^T); needs padded (K/8+4) v2 weights."""
+    return torch.ops.pi05_w4a4.int4_gemm_glu(x, wg, wu)
 
 
 def int4_gemm3(
