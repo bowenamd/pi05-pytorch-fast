@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 
 from pi05_fast.w4a4.extension import int4_gemm
-from pi05_fast.w4a4.pack import pack_linear_weight, should_rotate
+from pi05_fast.w4a4.pack import pack_linear_weight, pad_packed_rows, should_rotate
 
 
 class W4A4Linear(nn.Module):
@@ -17,7 +19,10 @@ class W4A4Linear(nn.Module):
         self.out_features = packed.shape[0]
         self.in_features = (packed.shape[1] - 1) * 8
         self.rotate = should_rotate(self.in_features, rotate)
-        self.register_buffer("packed", packed.to(torch.int32), persistent=True)
+        packed = packed.to(torch.int32)
+        if os.environ.get("PI05_W4A4_KERNEL", "v1") == "v2":
+            packed = pad_packed_rows(packed)
+        self.register_buffer("packed", packed, persistent=True)
         # LeRobot reads ``proj.weight.dtype``; keep a dtype marker, not real weights.
         self.register_buffer(
             "weight",

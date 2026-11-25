@@ -74,6 +74,13 @@ def pack_linear_weight(weight: torch.Tensor, rotate: bool | None = None) -> torc
     return torch.cat([packed, scale_bits], dim=-1)
 
 
+def pad_packed_rows(packed: torch.Tensor) -> torch.Tensor:
+    """[N, K/8+1] -> [N, K/8+4] (scale stays at column K/8); layout for the v2 gemm kernel."""
+    out = torch.zeros(packed.shape[0], packed.shape[1] + 3, dtype=torch.int32, device=packed.device)
+    out[:, : packed.shape[1]] = packed
+    return out
+
+
 def unpack_linear_weight(packed: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, int]:
     """Return (q [N,K], scale [N], K)."""
     n, row = packed.shape
