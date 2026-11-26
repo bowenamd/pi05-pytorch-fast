@@ -44,6 +44,7 @@ Machine: AMD Ryzen AI Max+ / Radeon 8060S (`gfx1151`).
 |--------|--------|
 | E2E action chunk latency | **104 ms** default, **81 ms** with `PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1` (median; `scripts/bench_latency.py`, 1-NFE `sample_actions`) |
 | E2E latency, fastest config (2026-11-26) | **64.8 ms** with the fast knobs + `PI05_W4A4_KERNEL=v2 PI05_W4A4_GLU=1` + TunableOp (on by default in `env.sh`); see [Latency](#latency-synthetic-not-sim) |
+| Memory, fastest config (2026-11-26) | **7.6 GB** system memory above idle, peak = steady (was ~17 GB peak / ~12 GB steady); model load ~20 s (was ~80 s); see [Memory footprint](#memory-footprint) |
 | LIBERO-10 accuracy | **20/20 = 100%** (2 episodes × 10 tasks, seed 0); unchanged with the knobs above (39/40 over seeds 0+1 either way). Fastest config: 19/20 at seed 0, same as the fast config |
 | `n_action_steps` / `num_inference_steps` | 10 / 1 |
 | Prefix tokens | 776 (batched SigLIP + empty-camera pool 256→64); **640** with `PI05_LANG_TOKENS=64` |
@@ -79,6 +80,8 @@ Closed-loop **LeRobot PI05Policy** inference:
 6. **`torch.compile(max-autotune-no-cudagraphs, fullgraph=True)`** + gfx1151 L2 antialias
 7. LM / expert attention **eager** (Inductor); SigLIP **SDPA**
 8. `n_action_steps=10`, `num_inference_steps=1`
+9. Low-peak loader (`pi05_fast/fast_load.py`): meta-device init, W4A4 swap and unused `lm_head`s dropped
+   before any weight is read, weights streamed tensor by tensor from safetensors to the GPU
 
 **pure PyTorch** path we have on this GPU.
 
@@ -238,10 +241,12 @@ Measured 2026-10-15 (83 samples, ref = stock lerobot fp32):
 Nearly all deviation comes from W4A4 on the prefix LM; bf16/compile/layout changes are
 lossless (>= 0.9999), and token trimming/camera cache add none.
 
-Compiled runs of two configs whose graphs differ (even bit-exact kernel swaps such as
-v1 → v2) agree only to cos ≈ 0.994: Inductor autotunes the bf16 parts differently and
-W4A4 amplifies the difference. With `PI05_COMPILE=0`, v1 and v2 produce bit-identical
-actions. Compare each config against the fp32 reference, not against each other.
+Compiled runs are not bit-reproducible across processes: two processes of the same
+config, loading the same cached compiled graph, agree only to cos ≈ 0.995 (max |Δ| ≈
+0.07-0.15 in normalized actions), and W4A4 amplifies the difference. Within one process
+and in eager mode (`PI05_COMPILE=0`) results are bit-identical, so use eager runs to show
+that two versions are equal (e.g. v1 vs v2 kernels, stock vs fast loader), and compare
+compiled configs only against the fp32 reference.
 
 ## Resource utilization (CPU / GPU / DRAM)
 
@@ -317,6 +322,29 @@ smeared by the 1 s SMU filter. Timed loop (`steady`, first 2 s dropped):
 | DRAM bandwidth | 74.6 GB/s (46.7 read + 27.9 write) ≈ 29% of spec, ~6 GB / inference |
 | Memory | host used 39 GB, process RSS 23 GB, GTT 6.8 GB, VRAM 1.3 GB |
 | Power | socket 140 W, gfx 55 W, gfxclk 2900 MHz |
+
+`proc_rss_mb` sums the whole process tree, including ~33 Inductor compile workers. Each
+worker maps the same shared libraries, so their RSS (~16 GB together) is counted many
+times while their private memory is ~0.1 GB in total. Use `host_mem_used_mb` above idle
+for the real footprint.
+
+### Memory footprint
+
+System memory above idle, fastest config (fast knobs + v2 + GLU + TunableOp), measured
+2026-11-26 with `monitor_util.py` around `bench_latency.py`:
+
+| Change | Peak | Steady | Notes |
+|---|---:|---:|---|
+| before | ~17 GB | ~12 GB | stock LeRobot load: full model built in fp32 with random init, moved to the GPU (8.7 GB), then the whole checkpoint read into host memory |
+| glibc mmap threshold pinned before loading | 16.9 GB | 9.1 GB | the freed ~4 GB load-time state dict stayed in the heap (`malloc_trim` cannot return it) |
+| `PI05_DROP_LM_HEAD=1` | 16.9 GB | 7.7 GB | PaliGemma (0.98 GB) and expert (0.49 GB) `lm_head`s are never used for actions |
+| `PI05_FAST_LOAD=1` | **7.6 GB** | **7.6 GB** | parameters on the meta device, W4A4 swap and head drop before loading, per-tensor copy to the GPU; load 80 s → 21 s |
+
+All three are on by default and do not change the loaded parameters (all 947 tensors
+bit-identical to the stock loader; eager actions bit-identical; LIBERO-10 seed 0 20/20;
+latency unchanged). The steady 7.6 GB is ~3.5 GB of weights, ~1 GB of padded weight
+copies made by the antialias freezing pass, activations/allocator slack, and ~2.6 GB of
+CPU-side PyTorch runtime.
 
 ## Memory traffic vs. compute per kernel (rocprofv3)
 
@@ -403,6 +431,8 @@ pi05-pytorch-fast/
 | `PYTORCH_TUNABLEOP_ENABLED` / `_TUNING` / `_FILENAME` | `1` / `0` / `$ROOT/configs/tunableop/gfx1151_fast%d.csv` | Reuse tuned GEMM selections (−3 ms); `TUNING=1` re-tunes |
 | `PI05_INDUCTOR_GEMM_BACKENDS` | `ATEN` | Inductor GEMM backend. ROCm 10.1 disables the origami heuristic, so Inductor mis-ranks triton over hipBLASLt; `ATEN` is ~2% faster. Set empty to restore triton autotune |
 | `PI05_LANG_TOKENS` | unset (off) | Trim trailing **padded** language tokens to this bucket (prefix = 576 + N). Real tokens are never dropped: if the prompt does not fit, the full 200 are used and a warning is printed. `64` → prefix 640 = exactly 5 `gemm_iu4` `BM=128` tiles (−14% E2E, LIBERO-10 still 20/20) |
+| `PI05_FAST_LOAD` | `1` | Low-peak loader (meta init, W4A4 swap before loading, streamed weights). `0` = stock `PI05Policy.from_pretrained` |
+| `PI05_DROP_LM_HEAD` | `1` | Drop the unused PaliGemma and expert `lm_head` weights (−1.47 GB GPU) |
 | `PI05_CACHE_EMPTY_CAM` | `0` (off) | Cache the empty-camera SigLIP embedding. With `empty_cameras=1` the placeholder camera is a constant `-1` image, so its embedding never changes, yet a full vision forward runs on it every frame. Caching it batches only the real cameras (−7 ms). Not bit-exact: bf16 SigLIP output depends on batch size (rel err ~4e-3) |
 | `SNAPFLOW_TEACHER_POLICY` | `~/model_data/pi05_libero_v044` | Processor json/safetensors |
 | `PALIGEMMA_TOKENIZER_PATH` | `~/model_data/paligemma2-3b-pt-224` | Local tokenizer |

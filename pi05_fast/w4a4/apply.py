@@ -66,7 +66,7 @@ def replace_linears_from_packed(
     return n
 
 
-def apply_w4a4_from_dir(model: nn.Module, pack_dir: str | Path) -> int:
+def apply_w4a4_from_dir(model: nn.Module, pack_dir: str | Path, device: torch.device | None = None) -> int:
     pack_dir = Path(pack_dir).expanduser()
     meta_path = pack_dir / "meta.json"
     st_path = pack_dir / "packed.safetensors"
@@ -76,7 +76,7 @@ def apply_w4a4_from_dir(model: nn.Module, pack_dir: str | Path) -> int:
     from safetensors.torch import load_file
 
     packed = load_file(str(st_path))
-    device = next(model.parameters()).device
+    device = device if device is not None else next(model.parameters()).device
     from pi05_fast.w4a4.extension import preload
 
     preload()
@@ -208,7 +208,8 @@ def maybe_apply_w4a4_from_env(model: nn.Module) -> int:
     path = os.environ.get("PI05_W4A4_PACK", "").strip()
     if not path:
         return 0
-    return apply_w4a4_from_dir(model, path)
+    n_done = sum(isinstance(m, W4A4Linear) for m in model.modules())
+    return n_done if n_done else apply_w4a4_from_dir(model, path)
 
 
 def pack_model_linears(

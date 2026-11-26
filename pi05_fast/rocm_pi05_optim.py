@@ -372,7 +372,12 @@ def install_rocm_pi05_eval_hooks() -> None:
 
     @classmethod
     def wrapped(cls, *args, **kwargs):
-        policy = orig(cls, *args, **kwargs)
+        if os.environ.get("PI05_FAST_LOAD", "1") != "0":
+            from pi05_fast.fast_load import fast_from_pretrained
+
+            policy = fast_from_pretrained(cls, *args, **kwargs)
+        else:
+            policy = orig(cls, *args, **kwargs)
         return apply_rocm_pi05_optimizations(policy)
 
     PI05Policy.from_pretrained = wrapped
