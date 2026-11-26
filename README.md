@@ -43,7 +43,8 @@ Machine: AMD Ryzen AI Max+ / Radeon 8060S (`gfx1151`).
 | Metric | Value |
 |--------|--------|
 | E2E action chunk latency | **104 ms** default, **81 ms** with `PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1` (median; `scripts/bench_latency.py`, 1-NFE `sample_actions`) |
-| LIBERO-10 accuracy | **20/20 = 100%** (2 episodes × 10 tasks, seed 0); unchanged with the knobs above (39/40 over seeds 0+1 either way) |
+| E2E latency, fastest config (2026-11-26) | **64.8 ms** with the fast knobs + `PI05_W4A4_KERNEL=v2 PI05_W4A4_GLU=1` + TunableOp (on by default in `env.sh`); see [Latency](#latency-synthetic-not-sim) |
+| LIBERO-10 accuracy | **20/20 = 100%** (2 episodes × 10 tasks, seed 0); unchanged with the knobs above (39/40 over seeds 0+1 either way). Fastest config: 19/20 at seed 0, same as the fast config |
 | `n_action_steps` / `num_inference_steps` | 10 / 1 |
 | Prefix tokens | 776 (batched SigLIP + empty-camera pool 256→64); **640** with `PI05_LANG_TOKENS=64` |
 
@@ -70,6 +71,10 @@ Closed-loop **LeRobot PI05Policy** inference:
 2. **W4A4** packed INT4 GEMM on the **PaliGemma prefix LM only** (HIP custom op)
 3. Prefix LM weights/activations in **fp16** (match W4A4; SigLIP stays bf16)
 4. Shared activation quant for QKV and gate/up (`int4_gemm3` / `int4_gemm2`)
+   - opt-in `PI05_W4A4_KERNEL=v2`: bit-exact INT4 GEMM with 128-bit loads (weight rows padded to `K/8+4`)
+   - opt-in `PI05_W4A4_GLU=1` (needs v2): `gelu_tanh(gate)·up` fused into the gate/up GEMM epilogue
+   - K=16384 (down_proj) activation quant uses a bit-exact transpose-based FWHT kernel (always on)
+   - TunableOp picks the fastest hipBLASLt/rocBLAS kernel per bf16/fp16 GEMM shape (`configs/tunableop/`)
 5. Batched SigLIP (3 cameras in one forward); empty-camera pool **256→64** → prefix **776**
 6. **`torch.compile(max-autotune-no-cudagraphs, fullgraph=True)`** + gfx1151 L2 antialias
 7. LM / expert attention **eager** (Inductor); SigLIP **SDPA**
@@ -158,6 +163,35 @@ PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1 \
 First call pays `torch.compile` autotune (minutes). Median after warmup is the number
 to compare (**104 ms** on 8060S, **81 ms** with both knobs).
 
+Fastest config (TunableOp is already enabled by `env.sh`):
+
+```bash
+PI05_LANG_TOKENS=64 PI05_CACHE_EMPTY_CAM=1 PI05_W4A4_KERNEL=v2 PI05_W4A4_GLU=1 \
+    python scripts/bench_latency.py                    #  65 ms
+```
+
+Check that the load log prints `kernel=v2 gelu-fused MLPs=18`.
+
+Step by step, measured 2026-11-26 (fast config, `PI05_BENCH_ITERS=100`, median of 2
+interleaved runs; GPU perf level `high`, CPU governor `performance`, raised `ryzenadj`
+power limits, so absolute numbers are a few ms below the 2026-09 table):
+
+| Change | E2E median | Output |
+|---|---|---|
+| fast config, original `gemm_iu4` | 79.5 ms | — |
+| `PI05_W4A4_KERNEL=v2`: 128-bit global/LDS loads, one barrier per K tile, LDS-staged epilogue | 75.5 ms | bit-exact |
+| `PI05_W4A4_GLU=1`: gelu·up in the gate/up epilogue (no fp16 gate/up round trip, no separate Triton kernel) | 68.5 ms | ≤1 fp16 ulp on 3.5e-5 of elements |
+| K=16384 activation quant: 2 LDS transposes instead of 8 LDS passes (170 → 126 µs per call, copy-bandwidth floor) | 67.7 ms | bit-exact |
+| TunableOp CSV (`configs/tunableop/gfx1151_fast0.csv`, 23 shapes: SigLIP, expert, attention bmm) | **64.8 ms** | different bf16 kernels |
+
+To re-tune after a ROCm / PyTorch / hipBLASLt upgrade (the CSV records library
+versions), delete `configs/tunableop/gfx1151_fast0.csv` and run the fastest config once
+with `PYTORCH_TUNABLEOP_TUNING=1` (a few minutes); existing entries are otherwise kept. Shapes not in the CSV (e.g. the default 776-token prefix) fall back
+to the default kernels. Disable with `PYTORCH_TUNABLEOP_ENABLED=0`.
+
+v2 padding matters: with an unpadded power-of-2 weight row stride the same kernel was
+1.7-3.4× slower (DRAM channel aliasing on gfx1151).
+
 The synthetic prompt fills 52 of the 200 padded language tokens, matching LIBERO-10
 (`PI05_BENCH_LANG_LEN` overrides it).
 
@@ -198,9 +232,16 @@ Measured 2026-10-15 (83 samples, ref = stock lerobot fp32):
 | ROCm bf16 eager | 0.99995 | 0.99982 | 0.99988 | 1.0% |
 | W4A4 + compile (default) | 0.98751 | 0.87691 | 0.97079 | 14.8% |
 | fast (W4A4 + `LANG_TOKENS=64` + `CACHE_EMPTY_CAM=1`) | 0.98791 | 0.86084 | 0.96810 | 14.4% |
+| fast + v2 + GLU (2026-11-25) | 0.98872 | 0.89258 | 0.97133 | 14.2% |
+| fast + v2 + GLU + TunableOp (2026-11-26) | 0.98851 | 0.91143 | 0.97210 | 14.3% |
 
 Nearly all deviation comes from W4A4 on the prefix LM; bf16/compile/layout changes are
 lossless (>= 0.9999), and token trimming/camera cache add none.
+
+Compiled runs of two configs whose graphs differ (even bit-exact kernel swaps such as
+v1 → v2) agree only to cos ≈ 0.994: Inductor autotunes the bf16 parts differently and
+W4A4 amplifies the difference. With `PI05_COMPILE=0`, v1 and v2 produce bit-identical
+actions. Compare each config against the fp32 reference, not against each other.
 
 ## Resource utilization (CPU / GPU / DRAM)
 
@@ -330,6 +371,7 @@ pi05-pytorch-fast/
 ├── constraints-rocm.txt
 ├── requirements-lerobot-runtime.txt
 ├── env.sh                      # generated by setup.sh
+├── configs/tunableop/          # TunableOp GEMM selections (gfx1151, fast config)
 ├── pi05_fast/                  # runtime hooks (no ONNX)
 │   ├── rocm_pi05_optim.py
 │   ├── rocm_antialias.py
@@ -356,6 +398,9 @@ pi05-pytorch-fast/
 | `PI05_COMPILE_MODE` | `max-autotune-no-cudagraphs` | Inductor mode |
 | `PI05_PREFIX_LM_FP16` | `1` | Cast prefix LM to fp16 after W4A4 |
 | `PI05_W4A4_FUSE_QUANT` | `1` | Shared QKV / gate-up quant |
+| `PI05_W4A4_KERNEL` | `v1` | `v2`: pad packed weight rows to `K/8+4` at load and use the v2 INT4 GEMM (bit-exact, −4 ms) |
+| `PI05_W4A4_GLU` | `0` | `1` (needs `v2`): fuse `gelu_tanh(gate)·up` into the gate/up GEMM (−7 ms). Only applied if `act_fn` matches `F.gelu(approximate="tanh")` |
+| `PYTORCH_TUNABLEOP_ENABLED` / `_TUNING` / `_FILENAME` | `1` / `0` / `$ROOT/configs/tunableop/gfx1151_fast%d.csv` | Reuse tuned GEMM selections (−3 ms); `TUNING=1` re-tunes |
 | `PI05_INDUCTOR_GEMM_BACKENDS` | `ATEN` | Inductor GEMM backend. ROCm 10.1 disables the origami heuristic, so Inductor mis-ranks triton over hipBLASLt; `ATEN` is ~2% faster. Set empty to restore triton autotune |
 | `PI05_LANG_TOKENS` | unset (off) | Trim trailing **padded** language tokens to this bucket (prefix = 576 + N). Real tokens are never dropped: if the prompt does not fit, the full 200 are used and a warning is printed. `64` → prefix 640 = exactly 5 `gemm_iu4` `BM=128` tiles (−14% E2E, LIBERO-10 still 20/20) |
 | `PI05_CACHE_EMPTY_CAM` | `0` (off) | Cache the empty-camera SigLIP embedding. With `empty_cameras=1` the placeholder camera is a constant `-1` image, so its embedding never changes, yet a full vision forward runs on it every frame. Caching it batches only the real cameras (−7 ms). Not bit-exact: bf16 SigLIP output depends on batch size (rel err ~4e-3) |
@@ -370,6 +415,9 @@ pi05-pytorch-fast/
 - Quantizing SigLIP 4-bit (MLP `K=4304` not multiple of 64; attn projections cost ~1 LIBERO
   episode for only −1.7% latency)
 - W4A4 on the action expert (at `M=50` the INT4 path is *slower* than bf16 hipBLASLt)
+- `gemm_iu4` grid reorder for L2 weight reuse (≤2%: the kernel is limited by its own load
+  instructions, not DRAM)
+- GLU tile sweep (10 configs): the current `128×64×64` tile is already the fastest
 - ONNX / MIGraphX / ORT (parent `pi05-migraphx` package)
 
 ## License / provenance
