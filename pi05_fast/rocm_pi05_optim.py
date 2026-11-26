@@ -13,6 +13,7 @@ Source: rocm-scripts/test/pytorch/lerobot_pi05.py and _openpi_setup.py
 
 from __future__ import annotations
 
+import ctypes
 import os
 import types
 from typing import Any
@@ -143,6 +144,25 @@ def _cast_floating_tensors(module, dtype) -> int:
     return n
 
 
+def drop_unused_lm_heads(model) -> int:
+    """pi0.5 never decodes text: drop the PaliGemma and expert vocab heads (~1.5 GB bf16)."""
+    n = 0
+    pwe = model.paligemma_with_expert
+    for owner in (pwe.paligemma, pwe.gemma_expert):
+        if getattr(owner, "lm_head", None) is not None:
+            owner.lm_head = None
+            n += 1
+    return n
+
+
+def _pin_malloc_mmap_threshold(nbytes: int = 1 << 20) -> None:
+    # glibc raises its mmap threshold after large frees, so the freed load-time state dict stays in the heap.
+    try:
+        ctypes.CDLL("libc.so.6").mallopt(-3, nbytes)  # M_MMAP_THRESHOLD
+    except (OSError, AttributeError):
+        pass
+
+
 def enable_prefix_lm_fp16(model) -> None:
     """Run PaliGemma prefix LM in fp16 so W4A4 GEMMs match Embedl (no bf16 sandwich)."""
     import torch
@@ -210,6 +230,9 @@ def apply_rocm_pi05_optimizations(policy: Any, *, compile_model: bool | None = N
     if hasattr(model, "gradient_checkpointing_disable"):
         model.gradient_checkpointing_disable()
 
+    if os.environ.get("PI05_DROP_LM_HEAD", "1") != "0" and drop_unused_lm_heads(model):
+        print("rocm-opt: dropped unused lm_head weights (PaliGemma + expert)", flush=True)
+
     if torch.cuda.is_available():
         policy.to("cuda")
         model.to(torch.bfloat16)
@@ -233,6 +256,8 @@ def apply_rocm_pi05_optimizations(policy: Any, *, compile_model: bool | None = N
     n_w4a4 = maybe_apply_w4a4_from_env(model)
     if n_w4a4 and os.environ.get("PI05_PREFIX_LM_FP16", "1") != "0":
         enable_prefix_lm_fp16(model)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     if compile_model is None:
         compile_model = os.environ.get("PI05_COMPILE", "1") != "0"
@@ -342,6 +367,7 @@ def install_rocm_pi05_eval_hooks() -> None:
         return
     from lerobot.policies.pi05.modeling_pi05 import PI05Policy
 
+    _pin_malloc_mmap_threshold()
     orig = PI05Policy.from_pretrained.__func__
 
     @classmethod
