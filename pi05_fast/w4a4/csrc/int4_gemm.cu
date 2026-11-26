@@ -284,6 +284,112 @@ __global__ void quant_rot_rb(const _Float16* X, int* Q, float* sc, int M, long R
   }
 }
 
+typedef _Float16 half8v __attribute__((ext_vector_type(8)));
+typedef int int2q __attribute__((ext_vector_type(2)));
+
+// Bit-exact with quant_rot_rb<16384, 64>: same FWHT stage order and fp16 rounding points,
+// but stages 6..13 run in registers between two LDS transposes instead of 8 LDS passes.
+__global__ __launch_bounds__(256) void quant_rot_16k(const _Float16* __restrict__ X, int* __restrict__ Q,
+                                                     float* __restrict__ sc, int M, long RS) {
+  constexpr int K = 16384;
+  const int row = blockIdx.x;
+  if (row >= M) return;
+  const int tid = threadIdx.x;
+  __shared__ __attribute__((aligned(16))) _Float16 lds[K];
+  __shared__ float red[256];
+  float v[64];
+  // phase 1: thread owns bits 6..13, registers hold bits 0..5 (fp32, like the R=64 register stages)
+  const half8v* src = reinterpret_cast<const half8v*>(X + row * RS + tid * 64);
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    const half8v h = src[i];
+#pragma unroll
+    for (int j = 0; j < 8; j++) v[i * 8 + j] = (float)h[j];
+  }
+#pragma unroll
+  for (int len = 1; len < 64; len <<= 1)
+#pragma unroll
+    for (int i = 0; i < 64; i += 2 * len)
+#pragma unroll
+      for (int j = i; j < i + len; j++) {
+        const float a = v[j], b = v[j + len];
+        v[j] = a + b;
+        v[j + len] = a - b;
+      }
+  half8v* dst = reinterpret_cast<half8v*>(lds + tid * 64);
+#pragma unroll
+  for (int i = 0; i < 8; i++) {
+    half8v h;
+#pragma unroll
+    for (int j = 0; j < 8; j++) h[j] = (_Float16)v[i * 8 + j];
+    dst[i] = h;
+  }
+  __syncthreads();
+  // phase 2: thread owns bits 0..5 and 12..13, registers hold bits 6..11 (fp16 rounding per stage)
+  const int base = ((tid >> 6) << 12) | (tid & 63);
+#pragma unroll
+  for (int j = 0; j < 64; j++) v[j] = (float)lds[base + (j << 6)];
+#pragma unroll
+  for (int len = 1; len < 64; len <<= 1)
+#pragma unroll
+    for (int i = 0; i < 64; i += 2 * len)
+#pragma unroll
+      for (int j = i; j < i + len; j++) {
+        const float a = v[j], b = v[j + len];
+        v[j] = (float)(_Float16)(a + b);
+        v[j + len] = (float)(_Float16)(a - b);
+      }
+#pragma unroll
+  for (int j = 0; j < 64; j++) lds[base + (j << 6)] = (_Float16)v[j];
+  __syncthreads();
+  // phase 3: thread owns bits 4..11, registers hold bits 0..3 (16 consecutive) x bits 12..13
+#pragma unroll
+  for (int g = 0; g < 4; g++)
+#pragma unroll
+    for (int i = 0; i < 2; i++) {
+      const half8v h = *reinterpret_cast<const half8v*>(lds + (g << 12) + (tid << 4) + i * 8);
+#pragma unroll
+      for (int j = 0; j < 8; j++) v[g * 16 + i * 8 + j] = (float)h[j];
+    }
+#pragma unroll
+  for (int len = 16; len < 64; len <<= 1)
+#pragma unroll
+    for (int i = 0; i < 64; i += 2 * len)
+#pragma unroll
+      for (int j = i; j < i + len; j++) {
+        const float a = v[j], b = v[j + len];
+        v[j] = (float)(_Float16)(a + b);
+        v[j + len] = (float)(_Float16)(a - b);
+      }
+  float m = 0;
+#pragma unroll
+  for (int j = 0; j < 64; j++) m = fmaxf(m, fabsf(v[j]));
+  red[tid] = m;
+  __syncthreads();
+  for (int s = 128; s; s >>= 1) {
+    if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]);
+    __syncthreads();
+  }
+  const float sdiv = red[0] / 7.f + 1e-12f;
+  if (tid == 0) sc[row] = sdiv * rsqrtf((float)K);
+#pragma unroll
+  for (int g = 0; g < 4; g++) {
+    int2q w2;
+#pragma unroll
+    for (int w = 0; w < 2; w++) {
+      int pk = 0;
+#pragma unroll
+      for (int j = 0; j < 8; j++) {
+        int q = (int)lrintf(v[g * 16 + w * 8 + j] / sdiv);
+        q = max(-7, min(7, q));
+        pk |= (q & 0xF) << (j * 4);
+      }
+      w2[w] = pk;
+    }
+    *reinterpret_cast<int2q*>(Q + row * (K / 8) + (g << 9) + (tid << 1)) = w2;
+  }
+}
+
 __global__ void quant_rows(const _Float16* X, int* Q, float* sc, int M, int K) {
   int row = blockIdx.x;
   if (row >= M) return;
@@ -351,7 +457,9 @@ static QuantizedX quantize_x(torch::Tensor x) {
   int* qp = qx.q.data_ptr<int>();
   float* sap = qx.sa.data_ptr<float>();
 
-  if (K == 16384)
+  if (K == 16384 && reinterpret_cast<uintptr_t>(xp) % 16 == 0) {
+    quant_rot_16k<<<static_cast<int>(qx.M), TPB, 0, stream>>>(xp, qp, sap, static_cast<int>(qx.M), K);
+  } else if (K == 16384)
     quant_rot_rb<16384, 64><<<static_cast<int>(qx.M), TPB, 0, stream>>>(xp, qp, sap, static_cast<int>(qx.M), K);
   else if (K == 2048)
     quant_rot_rb<2048, 8><<<static_cast<int>(qx.M), TPB, 0, stream>>>(xp, qp, sap, static_cast<int>(qx.M), K);
